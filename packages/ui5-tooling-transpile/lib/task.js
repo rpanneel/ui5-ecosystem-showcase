@@ -1,11 +1,6 @@
 const log = require("@ui5/logger").getLogger("builder:customtask:ui5-tooling-transpile");
 const resourceFactory = require("@ui5/fs").resourceFactory;
-
-const { generateBundle } = require("./util");
-
-const espree = require('espree');
-const estraverse = require('estraverse');
-
+const { createBabelConfig, normalizeLineFeeds } = require("./util");
 
 /**
  * Custom task to create the UI5 AMD-like bundles for used ES imports from node_modules.
@@ -27,57 +22,50 @@ module.exports = async function ({
     taskUtil,
     options
 }) {
+    const config = options.configuration || {};
 
-    if (!taskUtil.isRootProject()) {
-        log.info(`Skipping execution. Current project '${options.projectName}' is not the root project.`);
-        return;
+    const babelConfig = createBabelConfig(config, false);
+
+    let filePatternConfig = config.filePattern;
+
+    if (!filePatternConfig) {
+        filePatternConfig = config.transpileTypeScript ? ".ts" : ".js";
     }
 
-    const allWorkspaceResources = await workspace.byGlob("/**/*.js");
-    const allDependenciesResources = await dependencies.byGlob("/**/*.js");
-    const allResources = [...allWorkspaceResources, ...allDependenciesResources];
-
-    const uniqueDeps = new Set();
+    //TODO: should we accept the full glob pattern as param or just the file pattern?
+    const allResources = await workspace.byGlob(`/**/*${filePatternConfig}`);
 
     await Promise.all(allResources.map(async (resource) => {
-        log.verbose(`Processing: ${resource.getPath()}`);
+        // Ignore files that match the excludePatterns configuration
+        if (!(config.excludePatterns || []).some(pattern => resource.getPath().includes(pattern))) {
+            const filePath = resource.getPath().replace(new RegExp("\\.[^.]+$"), ".js");
 
-        const content = await resource.getString();
-        const program = espree.parse(content, { range: true, comment: true, tokens: true, ecmaVersion: "latest" });
+            const transpileResult = await resource.getString().then((value) => {
+                config.debug && log.info("Transpiling file " + resource.getPath());
 
-        estraverse.traverse(program, {
-            enter(node, parent) {
-                if (node?.type === "CallExpression" &&
-                    /require|define/.test(node?.callee?.property?.name) &&
-                    node?.callee?.object?.property?.name == "ui" &&
-                    node?.callee?.object?.object?.name == "sap") {
-                    const depsArray = node.arguments.filter(arg => arg.type === "ArrayExpression");
-                    if (depsArray.length > 0) {
-                        const deps = depsArray[0].elements.filter(el => el.type === "Literal").map(el => el.value);
-                        deps.forEach(dep => uniqueDeps.add(dep));
-                    }
-                }
-            }
-        });
+                // add source file name
+                babelConfig.filename = resource.getPath();
 
-        return resource;
-
-    }));
-
-    const bundleCache = {};
-    await Promise.all(Array.from(uniqueDeps).map(async (dep) => {
-
-        log.verbose(`Trying to bundle dependency: ${dep}`);
-        const bundle = await generateBundle(dep);
-        if (bundle) {
-            log.info(`Bundle dependency: ${dep}`);
-            const bundleResource = resourceFactory.createResource({
-                path: `/resources/${dep}.js`,
-                string: bundle
+                return babel.transformAsync(value, babelConfig);
             });
-            await workspace.write(bundleResource);
+
+            const code = normalizeLineFeeds(transpileResult.code);
+            resource.setString(code);
+            resource.setPath(filePath);
+
+            // Create SourceMap File if requested
+            if (transpileResult.map) {
+                const filename = filePath.split("/").pop();
+                //add the transpiled file name
+                transpileResult.map.file = filename;
+
+                const resourceMap = resourceFactory.createResource({
+                    path: `${filePath}.map`,
+                    string: JSON.stringify(transpileResult.map)
+                });
+
+                workspace.write(resourceMap);
+            }
         }
-
     }));
-
 };
