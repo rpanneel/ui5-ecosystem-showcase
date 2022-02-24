@@ -1,4 +1,7 @@
+const babel = require("@babel/core");
 const log = require("@ui5/logger").getLogger("server:custommiddleware:ui5-tooling-transpile");
+const parseurl = require("parseurl");
+const util = require("../../ui5-tooling-modules/lib/util");
 
 const { generateBundle } = require("./util");
 
@@ -20,48 +23,74 @@ const { generateBundle } = require("./util");
  * @returns {function} Middleware function to use
  */
 module.exports = function ({
-    resources, options, middlewareUtil
+    resources,
+    options,
+    middlewareUtil
 }) {
 
-    const config = options.configuration || {}
+    const config = options.configuration || {};
+
+    const babelConfig = createBabelConfig(config, false);
+
+    let filePatternConfig = config.filePattern;
+
+    if (!filePatternConfig) {
+        filePatternConfig = config.transpileTypeScript ? ".ts" : ".js";
+    }
 
     return async (req, res, next) => {
 
-        const time = Date.now();
+        if (
+            req.path &&
+            req.path.endsWith(".js") &&
+            !req.path.includes("resources/") &&
+            !(config.excludePatterns || []).some((pattern) => req.path.includes(pattern))
+        ) {
 
-        const match = /^\/resources\/(.*)\.js$/.exec(req.path);
-        if (match) {
+            const pathname = parseurl(req).pathname;
+            const pathWithPattern = pathname.replace(".js", filePatternConfig);
+            log.info(`---> ${pathWithPattern}`);
 
-            const bundle = await generateBundle(match[1]);
-            if (bundle) {
-                try {
+            try {
 
-                    // determine charset and content-type
-                    let {
-                        contentType,
-                        charset
-                    } = middlewareUtil.getMimeInfo(req.path);
-                    res.setHeader("Content-Type", contentType);
+                // grab the file via @ui5/fs.AbstractReader API
+                const matchedResources = await  resources.rootProject.byGlob(pathWithPattern);
+                config.debug && log.info(`handling ${req.path}...`);
 
-                    res.send(bundle);
+                if (!matchedResources || !matchedResources.length) {
+                    fileNotFoundError.file = pathWithPattern;
+                    throw fileNotFoundError;
+                }
 
-                    res.end();
+                // prefer js over other extensions, otherwise grab first possible path
+                const resource = matchedResources.find((r) => r.getPath() === pathname) || matchedResources[0]
+                if (matchedResources.length > 1) {
+                    log.warn(`found more than 1 file for given pattern (${filePatternConfig}): ${matchedResources.map((r) => r.getPath()).join(", ")} `);
+                    log.info(`using: ${resource.getPath()}`);
+                }
 
-                    log.verbose(`Created bundle for ${req.path}`);
+                // read file into string
+                const source = resource.getString();
 
-                    log.info(`Bundling took ${(Date.now() - time)} millis`);
+                config.debug ? log.info(`...${pathWithPattern} transpiled!`) : null
+                const babelConfigForFile = merge({}, babelConfig, {
+                    filename: pathWithPattern // necessary for source map <-> source assoc
+                })
+                let result = babel.transformAsync(source, babelConfigForFile);
 
-                    return;
+                // send out transpiled source + source map
+                res.type(".js");
+                res.end(util.normalizeLineFeeds(result));
 
-                } catch (err) {
-                    log.error(`Couldn't write bundle ${match[1]}: ${err}`);
+            } catch(err) {
+                if (err.code === 404) {
+                    log.warn(`...file not found: ${err.file}!`)
+                } else {
+                    log.error(err)
                 }
             }
-
         }
 
         next();
-
     }
-
 }
